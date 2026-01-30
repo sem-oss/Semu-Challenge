@@ -180,11 +180,54 @@ app.command('/이슈!', async ({ command, ack, respond, client }) => {
             ? (currentCycle.name || `V.1.0.${currentCycle.number}`)
             : 'None';
 
-        const messageText = `✅ 이슈가 생성되었습니다!\n*제목:* ${title}\n*담당자:* ${linearUser.name}\n*빌드:* ${buildVersion}\n*링크:* <${issue.url}|바로가기>`;
-
         await respond({
-            response_type: 'in_channel', // Visible to everyone
-            text: messageText
+            response_type: 'in_channel',
+            blocks: [
+                {
+                    type: "section",
+                    text: {
+                        type: "mrkdwn",
+                        text: `✅ *새로운 이슈가 생성되었습니다!*`
+                    }
+                },
+                {
+                    type: "section",
+                    fields: [
+                        {
+                            type: "mrkdwn",
+                            text: `*제목:*\n${title}`
+                        },
+                        {
+                            type: "mrkdwn",
+                            text: `*담당자:*\n${linearUser.name}`
+                        },
+                        {
+                            type: "mrkdwn",
+                            text: `*빌드:*\n${buildVersion}`
+                        },
+                        {
+                            type: "mrkdwn",
+                            text: `*상태:*\nTodo`
+                        }
+                    ]
+                },
+                {
+                    type: "actions",
+                    elements: [
+                        {
+                            type: "button",
+                            text: {
+                                type: "plain_text",
+                                text: "리니어에서 확인하기 🚀",
+                                emoji: true
+                            },
+                            url: issue.url,
+                            action_id: "view_issue",
+                            style: "primary"
+                        }
+                    ]
+                }
+            ]
         });
 
     } catch (error) {
