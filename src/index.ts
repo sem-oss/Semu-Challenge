@@ -241,10 +241,12 @@ app.command('/이슈!', async ({ command, ack, respond, client }) => {
             ]
         });
 
+        console.log(`[Debug] Post Root Message Success: ${rootMessage.ts}`);
+
         if (!rootMessage.ts) throw new Error("Failed to get root message TS.");
 
         // 6. Post Threaded Actions Message
-        await client.chat.postMessage({
+        const threadMessage = await client.chat.postMessage({
             channel: command.channel_id,
             thread_ts: rootMessage.ts,
             text: "관리 도구",
@@ -283,6 +285,8 @@ app.command('/이슈!', async ({ command, ack, respond, client }) => {
                 }
             ]
         });
+
+        console.log(`[Debug] Post Thread Message Success: ${threadMessage.ts}`);
 
     } catch (error) {
         console.error(error);
