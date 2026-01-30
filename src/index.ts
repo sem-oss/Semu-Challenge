@@ -217,26 +217,6 @@ app.command('/이슈!', async ({ command, ack, respond, client }) => {
                             text: `*상태:*\nTodo`
                         }
                     ]
-                },
-                {
-                    type: "divider"
-                },
-                {
-                    type: "section",
-                    text: {
-                        type: "mrkdwn",
-                        text: "우선순위, 기한, 스프린트, 라벨, 에픽 등을 설정하고 싶다면 👉"
-                    },
-                    accessory: {
-                        type: "button",
-                        text: {
-                            type: "plain_text",
-                            text: "리니어에서 보기",
-                            emoji: true
-                        },
-                        url: issue.url,
-                        action_id: "view_issue"
-                    }
                 }
             ]
         });
@@ -251,6 +231,27 @@ app.command('/이슈!', async ({ command, ack, respond, client }) => {
             thread_ts: rootMessage.ts,
             text: "관리 도구",
             blocks: [
+                {
+                    type: "section",
+                    text: {
+                        type: "mrkdwn",
+                        text: "우선순위, 기한, 라벨 등을 설정하고 싶다면 👉"
+                    },
+                    accessory: {
+                        type: "button",
+                        text: {
+                            type: "plain_text",
+                            text: "리니어에서 확인하기 🚀",
+                            emoji: true
+                        },
+                        url: issue.url,
+                        action_id: "view_issue",
+                        style: "primary"
+                    }
+                },
+                {
+                    type: "divider"
+                },
                 {
                     type: "header",
                     text: {
@@ -303,8 +304,7 @@ app.command('/이슈!', async ({ command, ack, respond, client }) => {
                                 emoji: true
                             },
                             action_id: "mark_done",
-                            value: issue.id,
-                            style: "primary"
+                            value: issue.id
                         }
                     ]
                 }
@@ -454,8 +454,9 @@ app.action('mark_done', async ({ action, ack, body, client }) => {
 
         // Update the Thread message (to remove the button)
         const threadBlocks: any = (body as any).message.blocks;
-        if (threadBlocks[3] && threadBlocks[3].elements) {
-            threadBlocks[3].elements = threadBlocks[3].elements.filter((el: any) => el.action_id !== 'mark_done');
+        // Mark done button is now at index 5 (0: View in Linear, 1: Divider, 2: Who header, 3: Assign actions, 4: Done header, 5: Done actions)
+        if (threadBlocks[5] && threadBlocks[5].elements) {
+            threadBlocks[5].elements = threadBlocks[5].elements.filter((el: any) => el.action_id !== 'mark_done');
         }
 
         const currentChannelId = (body as any).channel?.id;
@@ -468,6 +469,13 @@ app.action('mark_done', async ({ action, ack, body, client }) => {
                 ts: currentMessageTs,
                 blocks: threadBlocks,
                 text: "✅ 이슈가 완료 처리되었습니다."
+            });
+
+            // Post a feedback message in thread
+            await client.chat.postMessage({
+                channel: currentChannelId,
+                thread_ts: threadTs || currentMessageTs,
+                text: `✅ <@${body.user.id}>님이 이 이슈를 완료 처리했습니다.`
             });
         }
 
