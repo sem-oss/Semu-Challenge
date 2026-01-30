@@ -1,6 +1,7 @@
-import { App, LogLevel } from '@slack/bolt';
+import { App, LogLevel, ExpressReceiver } from '@slack/bolt';
 import { LinearClient } from '@linear/sdk';
 import * as dotenv from 'dotenv';
+import * as bodyParser from 'body-parser';
 
 dotenv.config();
 
@@ -9,7 +10,16 @@ const linearClient = new LinearClient({
     apiKey: process.env.LINEAR_API_KEY,
 });
 
-// Initialize Slack Bolt App
+// Initialize Express Receiver for Webhooks
+const receiver = new ExpressReceiver({
+    signingSecret: process.env.SLACK_SIGNING_SECRET || 'test', // Fallback for dev
+    processBeforeResponse: true
+});
+
+// Use custom body parser for webhook handling
+receiver.router.use(bodyParser.json());
+
+// Initialize Slack Bolt App with Socket Mode AND Receiver
 const app = new App({
     token: process.env.SLACK_BOT_TOKEN,
     appToken: process.env.SLACK_APP_TOKEN,
@@ -75,6 +85,162 @@ async function getCurrentCycle(teamId: string) {
     return null;
 }
 
+// -------------------------------------------------------------
+// FEATURE: Slack -> Linear Comment Sync
+// -------------------------------------------------------------
+app.message(async ({ message, client }) => {
+    // 1. Ignore bot messages / subtype messages (like thread_broadcast)
+    if ((message as any).subtype || (message as any).bot_id) return;
+
+    // 2. Check if in a thread (has thread_ts)
+    if (!(message as any).thread_ts) return;
+
+    try {
+        const threadTs = (message as any).thread_ts;
+        const channelId = (message as any).channel;
+        const text = (message as any).text;
+        const user = (message as any).user;
+
+        // 3. Get Root Message to find Issue ID
+        const history = await client.conversations.replies({
+            channel: channelId,
+            ts: threadTs,
+            latest: threadTs,
+            limit: 1,
+            inclusive: true
+        });
+
+        const rootMessage = history.messages?.[0];
+        if (!rootMessage || !rootMessage.text) return;
+
+        // Extract Issue Identifier: e.g., "[1SW-123]"
+        const match = rootMessage.text.match(/\[([A-Z0-9]+-\d+)\]/);
+        if (!match) return;
+
+        const issueIdentifier = match[1];
+        const lastDashIndex = issueIdentifier.lastIndexOf('-');
+        const teamKey = issueIdentifier.substring(0, lastDashIndex);
+        const issueNumber = parseInt(issueIdentifier.substring(lastDashIndex + 1), 10);
+
+        console.log(`[Sync] Found Reply to Issue ${issueIdentifier} (Key: ${teamKey}, No: ${issueNumber})`);
+
+        // 4. Find Linear Issue
+        const issues = await linearClient.issues({
+            filter: {
+                number: { eq: issueNumber },
+                team: { key: { eq: teamKey } }
+            }
+        });
+
+        if (issues.nodes.length === 0) return;
+        const issue = issues.nodes[0];
+
+        // 5. Create Comment on Linear
+        // Get user name for better context
+        const userInfo = await client.users.info({ user });
+        const userName = userInfo.user?.real_name || "Slack User";
+
+        if (text) {
+            await linearClient.createComment({
+                issueId: issue.id,
+                body: `${text}\n\n_(from Slack by ${userName})_`
+            });
+            console.log(`[Sync] Posted comment to Linear Issue ${issueIdentifier}`);
+        }
+
+    } catch (error) {
+        console.error(`[Sync Error s->l]`, error);
+    }
+});
+
+
+// -------------------------------------------------------------
+// FEATURE: Linear -> Slack Bidirectional Sync (Webhook)
+// Endpoint: /linear/webhook
+// -------------------------------------------------------------
+receiver.router.post('/linear/webhook', async (req, res) => {
+    // Acknowledge immediately
+    res.status(200).send();
+
+    try {
+        const body = req.body;
+        const { action, type, data } = body;
+
+        // Filter: Only care about Issue Updates or Comment Creates
+        if (type !== 'Issue' && type !== 'Comment') return;
+
+        // 1. Identify the Issue Identifier
+        let issueIdentifier = '';
+        let messageText = '';
+
+        if (type === 'Issue' && action === 'update') {
+            // E.g. Status change
+            const stateId = data.stateId;
+            const previousStateId = body.updatedFrom?.stateId;
+
+            if (stateId && previousStateId && stateId !== previousStateId) {
+                const issue = await linearClient.issue(data.id);
+                const state = await issue.state;
+
+                issueIdentifier = issue.identifier;
+                messageText = `🛠️ *상태 변경*: ${state?.name}`;
+            } else if (data.assigneeId && body.updatedFrom?.assigneeId !== undefined) {
+                // Assignee changed
+                const issue = await linearClient.issue(data.id);
+                const assignee = await issue.assignee;
+                issueIdentifier = issue.identifier;
+                messageText = `👤 *담당자 변경*: ${assignee ? assignee.name : 'Unassigned'}`;
+            }
+
+        } else if (type === 'Comment' && action === 'create') {
+            const commentBody = data.body;
+            // Loop Prevention: If comment contains "(from Slack by ...)", ignore it
+            if (commentBody?.includes('(from Slack by')) return;
+
+            const issue = await linearClient.issue(data.issueId);
+            const user = await linearClient.user(data.userId);
+
+            issueIdentifier = issue.identifier;
+            messageText = `💬 *새로운 댓글 (${user.name})*:\n${commentBody}`;
+        }
+
+        if (!issueIdentifier || !messageText) return;
+
+        console.log(`[Sync] Webhook received for ${issueIdentifier} - ${messageText}`);
+
+        // 2. Find Slack Thread
+        // Strategy: Search for the Issue Identifier in Slack
+        const searchResult = await app.client.search.messages({
+            query: `"${issueIdentifier}"`, // Quote for exact phrase
+            sort: 'timestamp',
+            sort_dir: 'desc',
+            count: 1
+        });
+
+        const match = searchResult.messages?.matches?.[0];
+        if (!match) {
+            console.log(`[Sync] Could not find Slack thread for ${issueIdentifier}`);
+            return;
+        }
+
+        const channelId = match.channel?.id;
+        const threadTs = match.ts;
+
+        if (channelId && threadTs) {
+            await app.client.chat.postMessage({
+                channel: channelId,
+                thread_ts: threadTs,
+                text: messageText
+            });
+            console.log(`[Sync] Updated Slack thread for ${issueIdentifier}`);
+        }
+
+    } catch (error) {
+        console.error(`[Sync Error l->s]`, error);
+    }
+});
+
+
 // Slack Command Handler
 app.command('/이슈!', async ({ command, ack, respond, client }) => {
     console.log(`[Debug] Command received: ${command.command} with text: ${command.text}`);
@@ -83,7 +249,7 @@ app.command('/이슈!', async ({ command, ack, respond, client }) => {
     const title = command.text.trim();
     if (!title) {
         await respond({
-            text: "❌ 제목을 입력해주세요. 예: `/이슈생성 로그인 버그 수정`",
+            text: "❌ 제목을 입력해주세요. 예: `/이슈! 로그인 버그 수정`",
             response_type: 'ephemeral'
         });
         return;
@@ -105,10 +271,6 @@ app.command('/이슈!', async ({ command, ack, respond, client }) => {
         // 2. Match Linear User
         const linearUser = await getLinearUserByEmail(userEmail);
         if (!linearUser) {
-            // Fallback: Create unassigned if user not found, or error?
-            // Let's warn the user but proceed unassigned? Or error?
-            // Requirement says "ticket defaults to created by assignee" so we probably need the user.
-            // Let's assume we need the user.
             await respond({
                 text: `❌ Linear에서 이메일(${userEmail})에 해당하는 사용자를 찾을 수 없습니다.`,
                 response_type: 'ephemeral'
@@ -162,12 +324,6 @@ app.command('/이슈!', async ({ command, ack, respond, client }) => {
             issuePayload.cycleId = currentCycle.id;
         }
 
-        // We need to find the "Todo" state or rely on default. 
-        // Usually creating without stateId puts it in the default state (Todo/Backlog).
-        // Requirement says "to do 티켓 디폴트로 생성".
-        // We can fetch states for the team to be safe, but default is usually cleaner if configured in Linear.
-        // Let's stick to default behavior first.
-
         const issueCreate = await linearClient.createIssue(issuePayload);
         const issue = await issueCreate.issue;
 
@@ -217,20 +373,7 @@ app.command('/이슈!', async ({ command, ack, respond, client }) => {
                             text: `*상태:*\nTodo`
                         }
                     ]
-                }
-            ]
-        });
-
-        console.log(`[Debug] Post Root Message Success: ${rootMessage.ts}`);
-
-        if (!rootMessage.ts) throw new Error("Failed to get root message TS.");
-
-        // 6. Post Threaded Actions Message
-        const threadMessage = await client.chat.postMessage({
-            channel: command.channel_id,
-            thread_ts: rootMessage.ts,
-            text: "관리 도구",
-            blocks: [
+                },
                 {
                     type: "section",
                     text: {
@@ -311,6 +454,26 @@ app.command('/이슈!', async ({ command, ack, respond, client }) => {
             ]
         });
 
+        console.log(`[Debug] Post Root Message Success: ${rootMessage.ts}`);
+
+        if (!rootMessage.ts) throw new Error("Failed to get root message TS.");
+
+        // 6. Post Threaded Actions Message
+        const threadMessage = await client.chat.postMessage({
+            channel: command.channel_id,
+            thread_ts: rootMessage.ts,
+            text: "관리 도구",
+            blocks: [
+                {
+                    type: "section",
+                    text: {
+                        type: "mrkdwn",
+                        text: "*관리 도구가 여기로 이동했습니다.*"
+                    }
+                }
+            ]
+        });
+
         console.log(`[Debug] Post Thread Message Success: ${threadMessage.ts}`);
 
     } catch (error) {
@@ -333,7 +496,6 @@ app.command('/이슈목록', async ({ command, ack, respond, client }) => {
     await ack();
 
     try {
-        // 1. Get Slack User Email
         const slackUser = await client.users.info({ user: command.user_id });
         const userEmail = slackUser.user?.profile?.email;
 
@@ -342,14 +504,12 @@ app.command('/이슈목록', async ({ command, ack, respond, client }) => {
             return;
         }
 
-        // 2. Match Linear User
         const linearUser = await getLinearUserByEmail(userEmail);
         if (!linearUser) {
             await respond({ text: "❌ Linear에서 사용자를 찾을 수 없습니다.", response_type: 'ephemeral' });
             return;
         }
 
-        // 3. Fetch Assigned Issues (only not completed/cancelled ones)
         const issues = await linearClient.issues({
             filter: {
                 assignee: { id: { eq: linearUser.id } },
@@ -362,7 +522,6 @@ app.command('/이슈목록', async ({ command, ack, respond, client }) => {
             return;
         }
 
-        // 4. Group by State
         const groupedIssues: Record<string, any[]> = {};
         for (const issue of issues.nodes) {
             const state = await issue.state;
@@ -371,7 +530,6 @@ app.command('/이슈목록', async ({ command, ack, respond, client }) => {
             groupedIssues[stateName].push(issue);
         }
 
-        // 5. Post Root Summary Message
         const rootMessage = await client.chat.postMessage({
             channel: command.channel_id,
             text: `🔍 <@${command.user_id}>님의 이슈 목록을 조회했습니다.`,
@@ -397,7 +555,6 @@ app.command('/이슈목록', async ({ command, ack, respond, client }) => {
 
         if (!rootMessage.ts) throw new Error("Failed to post root message.");
 
-        // 6. Post Detailed List in Thread
         const threadBlocks: any[] = [];
         for (const [stateName, stateIssues] of Object.entries(groupedIssues)) {
             threadBlocks.push({
@@ -616,6 +773,15 @@ app.action('mark_done', async ({ action, ack, body, client }) => {
 });
 
 (async () => {
-    await app.start(process.env.PORT || 3000);
-    console.log('⚡️ Slack Bolt app is running!');
+    const port = process.env.PORT || 3000;
+
+    // Start Bolt App (Socket Mode)
+    await app.start();
+    console.log('⚡️ Slack Bolt app is running (Socket Mode)!');
+
+    // Start Express Receiver (for Webhooks) - Use a wrapper to start it manually
+    // Since we are using SocketMode, app.start() handles the WS connection.
+    // But we need the http server for webhooks.
+    await receiver.start(Number(port));
+    console.log(`⚡️ Webhook Receiver is running on port ${port}!`);
 })();
