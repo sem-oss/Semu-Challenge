@@ -328,6 +328,91 @@ app.command('/이슈!', async ({ command, ack, respond, client }) => {
     }
 });
 
+// Slack Command Handler: 이슈 목록 조회
+app.command('/이슈목록', async ({ command, ack, respond, client }) => {
+    await ack();
+
+    try {
+        // 1. Get Slack User Email
+        const slackUser = await client.users.info({ user: command.user_id });
+        const userEmail = slackUser.user?.profile?.email;
+
+        if (!userEmail) {
+            await respond({ text: "❌ Slack 프로필에서 이메일을 찾을 수 없습니다.", response_type: 'ephemeral' });
+            return;
+        }
+
+        // 2. Match Linear User
+        const linearUser = await getLinearUserByEmail(userEmail);
+        if (!linearUser) {
+            await respond({ text: "❌ Linear에서 사용자를 찾을 수 없습니다.", response_type: 'ephemeral' });
+            return;
+        }
+
+        // 3. Fetch Assigned Issues (only not completed/cancelled ones)
+        const issues = await linearClient.issues({
+            filter: {
+                assignee: { id: { eq: linearUser.id } },
+                state: { type: { nin: ['completed', 'canceled'] } }
+            }
+        });
+
+        if (issues.nodes.length === 0) {
+            await respond({ text: "✅ 현재 나에게 할당된 진행 중인 이슈가 없습니다.", response_type: 'in_channel' });
+            return;
+        }
+
+        // 4. Group by State
+        const groupedIssues: Record<string, any[]> = {};
+        for (const issue of issues.nodes) {
+            const state = await issue.state;
+            const stateName = state?.name || 'Unknown';
+            if (!groupedIssues[stateName]) groupedIssues[stateName] = [];
+            groupedIssues[stateName].push(issue);
+        }
+
+        // 5. Create Blocks
+        const blocks: any[] = [
+            {
+                type: "section",
+                text: {
+                    type: "mrkdwn",
+                    text: `🔍 *<@${command.user_id}>님께 할당된 내 이슈 목록*`
+                }
+            },
+            { type: "divider" }
+        ];
+
+        for (const [stateName, stateIssues] of Object.entries(groupedIssues)) {
+            blocks.push({
+                type: "section",
+                text: {
+                    type: "mrkdwn",
+                    text: `*📂 ${stateName} (${stateIssues.length})*`
+                }
+            });
+
+            const issueLinks = stateIssues.map(i => `• <${i.url}|[${i.identifier}] ${i.title}>`).join('\n');
+            blocks.push({
+                type: "section",
+                text: {
+                    type: "mrkdwn",
+                    text: issueLinks
+                }
+            });
+        }
+
+        await respond({
+            response_type: 'in_channel',
+            blocks: blocks
+        });
+
+    } catch (error) {
+        console.error(error);
+        await respond({ text: `❌ 오류가 발생했습니다: ${(error as Error).message}`, response_type: 'ephemeral' });
+    }
+});
+
 // Action Handler: 나에게 할당 버튼 (Assign to me - Button)
 app.action('assign_to_me_btn', async ({ action, ack, body, client }) => {
     await ack();
