@@ -176,7 +176,11 @@ app.command('/이슈!', async ({ command, ack, respond, client }) => {
         }
 
         // 5. Respond
-        const messageText = `✅ 이슈가 생성되었습니다!\n*제목:* ${title}\n*담당자:* ${linearUser.name}\n*Cycle:* ${currentCycle ? currentCycle.number : 'None'}\n*링크:* ${issue.url}`;
+        const buildVersion = currentCycle
+            ? (currentCycle.name || `V.1.0.${currentCycle.number}`)
+            : 'None';
+
+        const messageText = `✅ 이슈가 생성되었습니다!\n*제목:* ${title}\n*담당자:* ${linearUser.name}\n*빌드:* ${buildVersion}\n*링크:* <${issue.url}|바로가기>`;
 
         await respond({
             response_type: 'in_channel', // Visible to everyone
