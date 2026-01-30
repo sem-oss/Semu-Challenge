@@ -371,20 +371,36 @@ app.command('/이슈목록', async ({ command, ack, respond, client }) => {
             groupedIssues[stateName].push(issue);
         }
 
-        // 5. Create Blocks
-        const blocks: any[] = [
-            {
-                type: "section",
-                text: {
-                    type: "mrkdwn",
-                    text: `🔍 *<@${command.user_id}>님께 할당된 내 이슈 목록*`
+        // 5. Post Root Summary Message
+        const rootMessage = await client.chat.postMessage({
+            channel: command.channel_id,
+            text: `🔍 <@${command.user_id}>님의 이슈 목록을 조회했습니다.`,
+            blocks: [
+                {
+                    type: "section",
+                    text: {
+                        type: "mrkdwn",
+                        text: `🔍 *<@${command.user_id}>님께 할당된 활성 이슈 목록*`
+                    }
+                },
+                {
+                    type: "context",
+                    elements: [
+                        {
+                            type: "mrkdwn",
+                            text: `총 ${issues.nodes.length}개의 이슈가 있습니다. 자세한 내용은 스레드를 확인해주세요! 👇`
+                        }
+                    ]
                 }
-            },
-            { type: "divider" }
-        ];
+            ]
+        });
 
+        if (!rootMessage.ts) throw new Error("Failed to post root message.");
+
+        // 6. Post Detailed List in Thread
+        const threadBlocks: any[] = [];
         for (const [stateName, stateIssues] of Object.entries(groupedIssues)) {
-            blocks.push({
+            threadBlocks.push({
                 type: "section",
                 text: {
                     type: "mrkdwn",
@@ -393,18 +409,21 @@ app.command('/이슈목록', async ({ command, ack, respond, client }) => {
             });
 
             const issueLinks = stateIssues.map(i => `• <${i.url}|[${i.identifier}] ${i.title}>`).join('\n');
-            blocks.push({
+            threadBlocks.push({
                 type: "section",
                 text: {
                     type: "mrkdwn",
                     text: issueLinks
                 }
             });
+            threadBlocks.push({ type: "divider" });
         }
 
-        await respond({
-            response_type: 'in_channel',
-            blocks: blocks
+        await client.chat.postMessage({
+            channel: command.channel_id,
+            thread_ts: rootMessage.ts,
+            text: "상세 이슈 리스트",
+            blocks: threadBlocks
         });
 
     } catch (error) {
