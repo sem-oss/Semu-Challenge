@@ -175,13 +175,24 @@ app.command('/이슈!', async ({ command, ack, respond, client }) => {
             throw new Error("Failed to fetch created issue details.");
         }
 
-        // 5. Respond
+        // Fetch all Linear users for the dropdown
+        const usersResponse = await linearClient.users();
+        const userOptions = usersResponse.nodes
+            .filter(u => u.active)
+            .map(u => ({
+                text: { type: "plain_text" as const, text: u.name },
+                value: JSON.stringify({ issueId: issue.id, userId: u.id })
+            }))
+            .slice(0, 100); // Slack limit
+
+        // 5. Post Root Message
         const buildVersion = currentCycle
             ? (currentCycle.name || `V.1.0.${currentCycle.number}`)
             : 'None';
 
-        await respond({
-            response_type: 'in_channel',
+        const rootMessage = await client.chat.postMessage({
+            channel: command.channel_id,
+            text: `✅ 새로운 이슈가 생성되었습니다: ${title}`,
             blocks: [
                 {
                     type: "section",
@@ -224,17 +235,40 @@ app.command('/이슈!', async ({ command, ack, respond, client }) => {
                             url: issue.url,
                             action_id: "view_issue",
                             style: "primary"
+                        }
+                    ]
+                }
+            ]
+        });
+
+        if (!rootMessage.ts) throw new Error("Failed to get root message TS.");
+
+        // 6. Post Threaded Actions Message
+        await client.chat.postMessage({
+            channel: command.channel_id,
+            thread_ts: rootMessage.ts,
+            text: "관리 도구",
+            blocks: [
+                {
+                    type: "section",
+                    text: {
+                        type: "mrkdwn",
+                        text: "*누가 해결할 이슈인가요?*"
+                    },
+                    accessory: {
+                        type: "static_select",
+                        placeholder: {
+                            type: "plain_text",
+                            text: "팀원 선택...",
+                            emoji: true
                         },
-                        {
-                            type: "button",
-                            text: {
-                                type: "plain_text",
-                                text: "나에게 할당 👤",
-                                emoji: true
-                            },
-                            action_id: "assign_to_me",
-                            value: issue.id
-                        },
+                        options: userOptions,
+                        action_id: "assign_to_user"
+                    }
+                },
+                {
+                    type: "actions",
+                    elements: [
                         {
                             type: "button",
                             text: {
@@ -259,40 +293,49 @@ app.command('/이슈!', async ({ command, ack, respond, client }) => {
     }
 });
 
-// Action Handler: 나에게 할당 (Assign to me)
-app.action('assign_to_me', async ({ action, ack, body, client }) => {
+// Action Handler: 팀원에게 할당 (Assign to user - Dropdown)
+app.action('assign_to_user', async ({ action, ack, body, client }) => {
     await ack();
-    if (action.type !== 'button' || !action.value) return;
+    if (action.type !== 'static_select' || !action.selected_option) return;
 
     try {
-        const issueId = action.value;
-        const slackUser = await client.users.info({ user: body.user.id });
-        const userEmail = slackUser.user?.profile?.email;
+        const { issueId, userId } = JSON.parse(action.selected_option.value);
+        const userName = action.selected_option.text.text;
 
-        if (!userEmail) throw new Error("Slack email not found.");
+        await linearClient.updateIssue(issueId, { assigneeId: userId });
 
-        const linearUser = await getLinearUserByEmail(userEmail);
-        if (!linearUser) throw new Error("Linear user not found.");
-
-        await linearClient.updateIssue(issueId, { assigneeId: linearUser.id });
-
-        // Update original message to show new assignee
-        const originalBlocks: any = (body as any).message.blocks;
-        if (originalBlocks[1] && originalBlocks[1].fields) {
-            originalBlocks[1].fields[1].text = `*담당자:*\n${linearUser.name}`;
-        }
-
+        // Update the root message to show the new assignee
+        // We need to find the root message TS which is the thread_ts of the current message
+        const threadTs = (body as any).message?.thread_ts;
         const channelId = (body as any).channel?.id;
-        const messageTs = (body as any).message?.ts;
 
-        if (channelId && messageTs) {
-            await client.chat.update({
+        if (threadTs && channelId) {
+            // First, get the root message content
+            const history = await client.conversations.replies({
                 channel: channelId,
-                ts: messageTs,
-                blocks: originalBlocks,
-                text: "✅ 담당자가 변경되었습니다."
+                ts: threadTs,
+                latest: threadTs,
+                limit: 1,
+                inclusive: true
             });
+
+            const rootMessage = history.messages?.[0];
+            if (rootMessage && rootMessage.blocks) {
+                const updatedBlocks = [...rootMessage.blocks];
+                // Fields block is usually index 1
+                if (updatedBlocks[1] && (updatedBlocks[1] as any).fields) {
+                    (updatedBlocks[1] as any).fields[1].text = `*담당자:*\n${userName}`;
+                }
+
+                await client.chat.update({
+                    channel: channelId,
+                    ts: threadTs,
+                    blocks: updatedBlocks as any,
+                    text: `✅ 담당자가 변경되었습니다: ${userName}`
+                });
+            }
         }
+
     } catch (error) {
         console.error(error);
     }
@@ -325,28 +368,51 @@ app.action('mark_done', async ({ action, ack, body, client }) => {
 
         await linearClient.updateIssue(issueId, { stateId: doneState.id });
 
-        // Update original message to show status change
-        const originalBlocks: any = (body as any).message.blocks;
-        if (originalBlocks[1] && originalBlocks[1].fields) {
-            originalBlocks[1].fields[3].text = `*상태:*\n${doneState.name}`;
+        // Update the Thread message (to remove the button)
+        const threadBlocks: any = (body as any).message.blocks;
+        if (threadBlocks[1] && threadBlocks[1].elements) {
+            threadBlocks[1].elements = threadBlocks[1].elements.filter((el: any) => el.action_id !== 'mark_done');
         }
 
-        // Remove 'Mark as Done' button since it's already done
-        if (originalBlocks[2] && originalBlocks[2].elements) {
-            originalBlocks[2].elements = originalBlocks[2].elements.filter((el: any) => el.action_id !== 'mark_done');
-        }
+        const currentChannelId = (body as any).channel?.id;
+        const currentMessageTs = (body as any).message?.ts;
+        const threadTs = (body as any).message?.thread_ts;
 
-        const channelId = (body as any).channel?.id;
-        const messageTs = (body as any).message?.ts;
-
-        if (channelId && messageTs) {
+        if (currentChannelId && currentMessageTs) {
             await client.chat.update({
-                channel: channelId,
-                ts: messageTs,
-                blocks: originalBlocks,
+                channel: currentChannelId,
+                ts: currentMessageTs,
+                blocks: threadBlocks,
                 text: "✅ 이슈가 완료 처리되었습니다."
             });
         }
+
+        // Update the Root message (to change Status text)
+        if (threadTs && currentChannelId) {
+            const history = await client.conversations.replies({
+                channel: currentChannelId,
+                ts: threadTs,
+                latest: threadTs,
+                limit: 1,
+                inclusive: true
+            });
+
+            const rootMessage = history.messages?.[0];
+            if (rootMessage && rootMessage.blocks) {
+                const updatedBlocks = [...(rootMessage.blocks as any[])];
+                if (updatedBlocks[1] && updatedBlocks[1].fields) {
+                    updatedBlocks[1].fields[3].text = `*상태:*\n${doneState.name}`;
+                }
+
+                await client.chat.update({
+                    channel: currentChannelId,
+                    ts: threadTs,
+                    blocks: updatedBlocks as any,
+                    text: `✅ 이슈 완료: ${doneState.name}`
+                });
+            }
+        }
+
     } catch (error) {
         console.error(error);
     }
