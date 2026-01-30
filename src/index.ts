@@ -192,22 +192,18 @@ app.command('/이슈!', async ({ command, ack, respond, client }) => {
 
         const rootMessage = await client.chat.postMessage({
             channel: command.channel_id,
-            text: `✅ 새로운 이슈가 생성되었습니다: ${title}`,
+            text: `[${issue.identifier}] ${title}`,
             blocks: [
                 {
                     type: "section",
                     text: {
                         type: "mrkdwn",
-                        text: `✅ *새로운 이슈가 생성되었습니다!*`
+                        text: `<${issue.url}|*[${issue.identifier}] ${title}*>`
                     }
                 },
                 {
                     type: "section",
                     fields: [
-                        {
-                            type: "mrkdwn",
-                            text: `*제목:*\n${title}`
-                        },
                         {
                             type: "mrkdwn",
                             text: `*담당자:*\n${linearUser.name}`
@@ -223,20 +219,24 @@ app.command('/이슈!', async ({ command, ack, respond, client }) => {
                     ]
                 },
                 {
-                    type: "actions",
-                    elements: [
-                        {
-                            type: "button",
-                            text: {
-                                type: "plain_text",
-                                text: "리니어에서 확인하기 🚀",
-                                emoji: true
-                            },
-                            url: issue.url,
-                            action_id: "view_issue",
-                            style: "primary"
-                        }
-                    ]
+                    type: "divider"
+                },
+                {
+                    type: "section",
+                    text: {
+                        type: "mrkdwn",
+                        text: "우선순위, 기한, 스프린트, 라벨, 에픽 등을 설정하고 싶다면 👉"
+                    },
+                    accessory: {
+                        type: "button",
+                        text: {
+                            type: "plain_text",
+                            text: "리니어에서 보기",
+                            emoji: true
+                        },
+                        url: issue.url,
+                        action_id: "view_issue"
+                    }
                 }
             ]
         });
@@ -252,20 +252,11 @@ app.command('/이슈!', async ({ command, ack, respond, client }) => {
             text: "관리 도구",
             blocks: [
                 {
-                    type: "section",
+                    type: "header",
                     text: {
-                        type: "mrkdwn",
-                        text: "*누가 해결할 이슈인가요?*"
-                    },
-                    accessory: {
-                        type: "static_select",
-                        placeholder: {
-                            type: "plain_text",
-                            text: "팀원 선택...",
-                            emoji: true
-                        },
-                        options: userOptions,
-                        action_id: "assign_to_user"
+                        type: "plain_text",
+                        text: "누가 해결할 이슈인가요?",
+                        emoji: true
                     }
                 },
                 {
@@ -275,11 +266,45 @@ app.command('/이슈!', async ({ command, ack, respond, client }) => {
                             type: "button",
                             text: {
                                 type: "plain_text",
-                                text: "처리 완료 ✅",
+                                text: "나에게 할당",
+                                emoji: true
+                            },
+                            action_id: "assign_to_me_btn",
+                            value: issue.id
+                        },
+                        {
+                            type: "static_select",
+                            placeholder: {
+                                type: "plain_text",
+                                text: "할당할 팀원 선택...",
+                                emoji: true
+                            },
+                            options: userOptions,
+                            action_id: "assign_to_user"
+                        }
+                    ]
+                },
+                {
+                    type: "header",
+                    text: {
+                        type: "plain_text",
+                        text: "이슈가 완료되었나요?",
+                        emoji: true
+                    }
+                },
+                {
+                    type: "actions",
+                    elements: [
+                        {
+                            type: "button",
+                            text: {
+                                type: "plain_text",
+                                text: "처리완료",
                                 emoji: true
                             },
                             action_id: "mark_done",
-                            value: issue.id
+                            value: issue.id,
+                            style: "primary"
                         }
                     ]
                 }
@@ -300,6 +325,55 @@ app.command('/이슈!', async ({ command, ack, respond, client }) => {
             text: `❌ 오류가 발생했습니다: ${errorMessage}`,
             response_type: 'ephemeral'
         });
+    }
+});
+
+// Action Handler: 나에게 할당 버튼 (Assign to me - Button)
+app.action('assign_to_me_btn', async ({ action, ack, body, client }) => {
+    await ack();
+    if (action.type !== 'button' || !action.value) return;
+
+    try {
+        const issueId = action.value;
+        const slackUser = await client.users.info({ user: body.user.id });
+        const userEmail = slackUser.user?.profile?.email;
+
+        if (!userEmail) throw new Error("Slack email not found.");
+
+        const linearUser = await getLinearUserByEmail(userEmail);
+        if (!linearUser) throw new Error("Linear user not found.");
+
+        await linearClient.updateIssue(issueId, { assigneeId: linearUser.id });
+
+        const threadTs = (body as any).message?.thread_ts;
+        const channelId = (body as any).channel?.id;
+
+        if (threadTs && channelId) {
+            const history = await client.conversations.replies({
+                channel: channelId,
+                ts: threadTs,
+                latest: threadTs,
+                limit: 1,
+                inclusive: true
+            });
+
+            const rootMessage = history.messages?.[0];
+            if (rootMessage && rootMessage.blocks) {
+                const updatedBlocks = [...(rootMessage.blocks as any[])];
+                if (updatedBlocks[1] && updatedBlocks[1].fields) {
+                    updatedBlocks[1].fields[0].text = `*담당자:*\n${linearUser.name}`;
+                }
+
+                await client.chat.update({
+                    channel: channelId,
+                    ts: threadTs,
+                    blocks: updatedBlocks as any,
+                    text: `✅ 담당자가 변경되었습니다: ${linearUser.name}`
+                });
+            }
+        }
+    } catch (error) {
+        console.error(error);
     }
 });
 
@@ -332,9 +406,9 @@ app.action('assign_to_user', async ({ action, ack, body, client }) => {
             const rootMessage = history.messages?.[0];
             if (rootMessage && rootMessage.blocks) {
                 const updatedBlocks = [...rootMessage.blocks];
-                // Fields block is usually index 1
+                // 담당자 field is index 0
                 if (updatedBlocks[1] && (updatedBlocks[1] as any).fields) {
-                    (updatedBlocks[1] as any).fields[1].text = `*담당자:*\n${userName}`;
+                    (updatedBlocks[1] as any).fields[0].text = `*담당자:*\n${userName}`;
                 }
 
                 await client.chat.update({
@@ -380,8 +454,8 @@ app.action('mark_done', async ({ action, ack, body, client }) => {
 
         // Update the Thread message (to remove the button)
         const threadBlocks: any = (body as any).message.blocks;
-        if (threadBlocks[1] && threadBlocks[1].elements) {
-            threadBlocks[1].elements = threadBlocks[1].elements.filter((el: any) => el.action_id !== 'mark_done');
+        if (threadBlocks[3] && threadBlocks[3].elements) {
+            threadBlocks[3].elements = threadBlocks[3].elements.filter((el: any) => el.action_id !== 'mark_done');
         }
 
         const currentChannelId = (body as any).channel?.id;
@@ -410,8 +484,9 @@ app.action('mark_done', async ({ action, ack, body, client }) => {
             const rootMessage = history.messages?.[0];
             if (rootMessage && rootMessage.blocks) {
                 const updatedBlocks = [...(rootMessage.blocks as any[])];
+                // 상태 field is index 2
                 if (updatedBlocks[1] && updatedBlocks[1].fields) {
-                    updatedBlocks[1].fields[3].text = `*상태:*\n${doneState.name}`;
+                    updatedBlocks[1].fields[2].text = `*상태:*\n${doneState.name}`;
                 }
 
                 await client.chat.update({
