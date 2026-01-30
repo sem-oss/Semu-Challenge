@@ -286,8 +286,14 @@ app.command('/이슈!', async ({ command, ack, respond, client }) => {
 
     } catch (error) {
         console.error(error);
+        let errorMessage = (error as Error).message;
+
+        if (errorMessage.includes("channel_not_found")) {
+            errorMessage = "봇이 이 채널에 초대되지 않았습니다. 채널에서 `/invite @봇이름`을 입력하여 봇을 초대해 주세요!";
+        }
+
         await respond({
-            text: `❌ 오류가 발생했습니다: ${(error as Error).message}`,
+            text: `❌ 오류가 발생했습니다: ${errorMessage}`,
             response_type: 'ephemeral'
         });
     }
