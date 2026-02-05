@@ -1,7 +1,9 @@
 import { App, LogLevel, ExpressReceiver } from '@slack/bolt';
-import { LinearClient } from '@linear/sdk';
+import { LinearClient, PaginationOrderBy } from '@linear/sdk';
 import * as dotenv from 'dotenv';
 import * as bodyParser from 'body-parser';
+import * as fs from 'fs';
+import * as path from 'path';
 
 dotenv.config();
 
@@ -86,6 +88,47 @@ async function getCurrentCycle(teamId: string) {
 }
 
 // -------------------------------------------------------------
+// HELPER: Thread Mapping Store (Local JSON)
+// -------------------------------------------------------------
+const THREAD_MAP_FILE = path.join(__dirname, '../thread_map.json');
+
+interface ThreadMap {
+    [issueIdentifier: string]: {
+        channelId: string;
+        threadTs: string;
+    };
+}
+
+const ThreadMappingStore = {
+    load: (): ThreadMap => {
+        try {
+            if (fs.existsSync(THREAD_MAP_FILE)) {
+                return JSON.parse(fs.readFileSync(THREAD_MAP_FILE, 'utf-8'));
+            }
+        } catch (e) {
+            console.error("Failed to load thread map", e);
+        }
+        return {};
+    },
+    save: (data: ThreadMap) => {
+        try {
+            fs.writeFileSync(THREAD_MAP_FILE, JSON.stringify(data, null, 2));
+        } catch (e) {
+            console.error("Failed to save thread map", e);
+        }
+    },
+    get: (issueIdentifier: string) => {
+        const data = ThreadMappingStore.load();
+        return data[issueIdentifier];
+    },
+    set: (issueIdentifier: string, channelId: string, threadTs: string) => {
+        const data = ThreadMappingStore.load();
+        data[issueIdentifier] = { channelId, threadTs };
+        ThreadMappingStore.save(data);
+    }
+};
+
+// -------------------------------------------------------------
 // FEATURE: Slack -> Linear Comment Sync
 // -------------------------------------------------------------
 app.message(async ({ message, client }) => {
@@ -113,8 +156,8 @@ app.message(async ({ message, client }) => {
         const rootMessage = history.messages?.[0];
         if (!rootMessage || !rootMessage.text) return;
 
-        // Extract Issue Identifier: e.g., "[1SW-123]"
-        const match = rootMessage.text.match(/\[([A-Z0-9]+-\d+)\]/);
+        // Extract Issue Identifier: e.g., "[1SW-123]" or "(1SW-123)" or plain "1SW-123"
+        const match = rootMessage.text.match(/\b([A-Z0-9]+-\d+)\b/);
         if (!match) return;
 
         const issueIdentifier = match[1];
@@ -209,22 +252,34 @@ receiver.router.post('/linear/webhook', async (req, res) => {
         console.log(`[Sync] Webhook received for ${issueIdentifier} - ${messageText}`);
 
         // 2. Find Slack Thread
-        // Strategy: Search for the Issue Identifier in Slack
-        const searchResult = await app.client.search.messages({
-            query: `"${issueIdentifier}"`, // Quote for exact phrase
-            sort: 'timestamp',
-            sort_dir: 'desc',
-            count: 1
-        });
+        // Strategy: Try ThreadMappingStore first, then fallback to search.messages
+        let channelId: string | undefined;
+        let threadTs: string | undefined;
 
-        const match = searchResult.messages?.matches?.[0];
-        if (!match) {
-            console.log(`[Sync] Could not find Slack thread for ${issueIdentifier}`);
-            return;
+        const mapped = ThreadMappingStore.get(issueIdentifier);
+        if (mapped) {
+            channelId = mapped.channelId;
+            threadTs = mapped.threadTs;
+            console.log(`[Sync] Found mapped thread for ${issueIdentifier}`);
+        } else {
+            console.log(`[Sync] No map found for ${issueIdentifier}, trying search...`);
+            const searchResult = await app.client.search.messages({
+                query: `"${issueIdentifier}"`, // Quote for exact phrase
+                sort: 'timestamp',
+                sort_dir: 'desc',
+                count: 1
+            });
+
+            const match = searchResult.messages?.matches?.[0];
+            if (match) {
+                channelId = match.channel?.id;
+                threadTs = match.ts;
+                // Auto-save mapping for future
+                if (channelId && threadTs) {
+                    ThreadMappingStore.set(issueIdentifier, channelId, threadTs);
+                }
+            }
         }
-
-        const channelId = match.channel?.id;
-        const threadTs = match.ts;
 
         if (channelId && threadTs) {
             await app.client.chat.postMessage({
@@ -233,6 +288,8 @@ receiver.router.post('/linear/webhook', async (req, res) => {
                 text: messageText
             });
             console.log(`[Sync] Updated Slack thread for ${issueIdentifier}`);
+        } else {
+            console.log(`[Sync] Could not find Slack thread for ${issueIdentifier}`);
         }
 
     } catch (error) {
@@ -348,14 +405,23 @@ app.command('/이슈!', async ({ command, ack, respond, client }) => {
 
         const rootMessage = await client.chat.postMessage({
             channel: command.channel_id,
-            text: `[${issue.identifier}] ${title}`,
+            text: `${title} (${issue.identifier})`,
             blocks: [
                 {
                     type: "section",
                     text: {
                         type: "mrkdwn",
-                        text: `<${issue.url}|*[${issue.identifier}] ${title}*>`
+                        text: `<${issue.url}|*${title}*>`
                     }
+                },
+                {
+                    type: "context",
+                    elements: [
+                        {
+                            type: "mrkdwn",
+                            text: `Issue: \`${issue.identifier}\``
+                        }
+                    ]
                 },
                 {
                     type: "section",
@@ -454,9 +520,10 @@ app.command('/이슈!', async ({ command, ack, respond, client }) => {
             ]
         });
 
-        console.log(`[Debug] Post Root Message Success: ${rootMessage.ts}`);
-
         if (!rootMessage.ts) throw new Error("Failed to get root message TS.");
+
+        // Save Mapping
+        ThreadMappingStore.set(issue.identifier, command.channel_id, rootMessage.ts);
 
         // 6. Post Threaded Actions Message
         const threadMessage = await client.chat.postMessage({
@@ -491,102 +558,367 @@ app.command('/이슈!', async ({ command, ack, respond, client }) => {
     }
 });
 
-// Slack Command Handler: 이슈 목록 조회
+// -------------------------------------------------------------
+// Issue list helpers (state/tag grouping + optional assignee override)
+// -------------------------------------------------------------
+const tagPrefixRegex = /^\s*(\[[^\]]+\]\s*)+/;
+const extractTitleTags = (title: string): string[] => {
+    const prefix = title.match(tagPrefixRegex)?.[0];
+    if (!prefix) return [];
+    const tags: string[] = [];
+    const re = /\[([^\]]+)\]/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(prefix)) !== null) {
+        const t = (m[1] || '').trim();
+        if (t) tags.push(t);
+    }
+    return tags;
+};
+
+async function getSlackEmailByUserId(client: any, userId: string): Promise<string | null> {
+    const slackUser = await client.users.info({ user: userId });
+    return slackUser.user?.profile?.email || null;
+}
+
+async function resolveSlackUserIdFromToken(client: any, token: string): Promise<string | null> {
+    const raw = (token || '').trim();
+    // allow tokens like "@jun," or "<@U123>,"
+    const cleaned = raw.replace(/[,:;]+$/g, '');
+
+    // Preferred: Slack mention token like <@U123ABC> or <@U123ABC|name>
+    const mention = cleaned.match(/^<@([A-Z0-9]+)(?:\|[^>]+)?>$/);
+    if (mention) return mention[1];
+
+    // Best-effort: plain @name
+    const at = cleaned.match(/^@([\w.\-]+)$/);
+    if (!at) return null;
+
+    const handle = (at[1] || '').trim();
+    const h = handle.toLowerCase();
+
+    const norm = (s?: string) => (s || '').trim().toLowerCase();
+
+    // NOTE: requires users:read. If not available, we'll just fail gracefully.
+    try {
+        let cursor: string | undefined = undefined;
+        for (let i = 0; i < 5; i++) { // safety cap
+            const res: any = await client.users.list({ limit: 200, cursor });
+            const members = res.members || [];
+            const match = members.find((m: any) => {
+                if (m.deleted || m.is_bot) return false;
+                const name = norm(m.name);
+                const dn = norm(m.profile?.display_name);
+                const dnn = norm(m.profile?.display_name_normalized);
+                const rn = norm(m.profile?.real_name);
+                const rnn = norm(m.profile?.real_name_normalized);
+                return name === h || dn === h || dnn === h || rn === h || rnn === h;
+            });
+            if (match?.id) return match.id;
+            cursor = res.response_metadata?.next_cursor;
+            if (!cursor) break;
+        }
+    } catch (e) {
+        console.warn("Failed to list users (missing users:read scope?)", e);
+    }
+
+    return null;
+}
+
+async function fetchActiveIssuesByAssigneeId(assigneeId: string) {
+    return linearClient.issues({
+        filter: {
+            assignee: { id: { eq: assigneeId } },
+            state: { type: { nin: ['completed', 'canceled'] } }
+        }
+    });
+}
+
+type IssueRow = { issue: any; assigneeName: string; tags: string[]; stateName: string };
+
+async function buildIssueRows(issues: any[]): Promise<IssueRow[]> {
+    const rows: IssueRow[] = [];
+    for (const issue of issues) {
+        const assignee = await issue.assignee;
+        const state = await issue.state;
+        rows.push({
+            issue,
+            assigneeName: assignee?.name || 'Unassigned',
+            tags: extractTitleTags(issue.title || ''),
+            stateName: state?.name || 'Unknown'
+        });
+    }
+    return rows;
+}
+
+function groupRowsByState(rows: IssueRow[]) {
+    const grouped: Record<string, IssueRow[]> = {};
+    for (const r of rows) {
+        const key = r.stateName;
+        if (!grouped[key]) grouped[key] = [];
+        grouped[key].push(r);
+    }
+    return grouped;
+}
+
+function groupRowsByTags(rows: IssueRow[], requestedTag?: string) {
+    const grouped: Record<string, IssueRow[]> = {};
+
+    for (const r of rows) {
+        const tags = r.tags;
+        if (tags.length === 0) {
+            const key = 'NoTag';
+            if (!requestedTag || requestedTag === key) {
+                if (!grouped[key]) grouped[key] = [];
+                grouped[key].push(r);
+            }
+            continue;
+        }
+
+        // duplicate inclusion for all tags
+        for (const t of tags) {
+            if (requestedTag && requestedTag !== t) continue;
+            if (!grouped[t]) grouped[t] = [];
+            grouped[t].push(r);
+        }
+    }
+
+    return grouped;
+}
+
+function sortGroupKeys(grouped: Record<string, any[]>) {
+    return Object.keys(grouped).sort((a, b) => {
+        const diff = (grouped[b]?.length || 0) - (grouped[a]?.length || 0);
+        if (diff !== 0) return diff;
+        return a.localeCompare(b);
+    });
+}
+
+async function postGroupedListToThread(params: {
+    client: any;
+    channelId: string;
+    requesterId: string;
+    assigneeSlackIds: string[];
+    mode: 'state' | 'tag';
+    requestedTag?: string;
+    grouped: Record<string, IssueRow[]>;
+    totalIssues: number;
+}) {
+    const { client, channelId, requesterId, assigneeSlackIds, mode, requestedTag, grouped, totalIssues } = params;
+
+    const groupKeys = sortGroupKeys(grouped);
+
+    const assigneesText = (assigneeSlackIds && assigneeSlackIds.length > 0)
+        ? assigneeSlackIds.map(id => `<@${id}>`).join(', ')
+        : `<@${requesterId}>`;
+
+    const header = mode === 'tag'
+        ? (requestedTag
+            ? `🔖 *<@${requesterId}>님 요청: ${assigneesText}의 태그별 활성 이슈 목록* (필터: \`${requestedTag}\`)`
+            : `🔖 *<@${requesterId}>님 요청: ${assigneesText}의 태그별 활성 이슈 목록*`)
+        : `🔍 *<@${requesterId}>님 요청: ${assigneesText}의 상태별 활성 이슈 목록*`;
+
+    const rootMessage = await client.chat.postMessage({
+        channel: channelId,
+        text: mode === 'tag' ? '태그별 이슈 목록' : '상태별 이슈 목록',
+        blocks: [
+            {
+                type: 'section',
+                text: { type: 'mrkdwn', text: header }
+            },
+            {
+                type: 'context',
+                elements: [
+                    {
+                        type: 'mrkdwn',
+                        text: `총 ${totalIssues}개의 이슈를 조회했습니다. (그룹 ${groupKeys.length}개) 자세한 내용은 스레드를 확인해주세요! 👇`
+                    }
+                ]
+            }
+        ]
+    });
+
+    if (!rootMessage.ts) throw new Error('Failed to post root message.');
+
+    const threadBlocks: any[] = [];
+    for (const key of groupKeys) {
+        const rows = grouped[key] || [];
+        threadBlocks.push({
+            type: 'section',
+            text: { type: 'mrkdwn', text: mode === 'tag' ? `*📂 [${key}] (${rows.length})*` : `*📂 ${key} (${rows.length})*` }
+        });
+
+        const lines = rows.map(r => `• <${r.issue.url}|${r.issue.title}>  —  *${r.assigneeName}*`);
+        threadBlocks.push({ type: 'section', text: { type: 'mrkdwn', text: lines.join('\n') } });
+        threadBlocks.push({ type: 'divider' });
+    }
+
+    await client.chat.postMessage({
+        channel: channelId,
+        thread_ts: rootMessage.ts,
+        text: mode === 'tag' ? '태그별 이슈 리스트' : '상태별 이슈 리스트',
+        blocks: threadBlocks
+    });
+}
+
+// -------------------------------------------------------------
+// Slack Command Handler: /이슈목록
+// - 기본: 상태별 그룹
+// - /이슈목록 태그 [TagName]: 태그별 그룹(+필터)
+// - /이슈목록 @jun,@sean : 복수 assignee 지원(권장: 멘션 선택)
+// - 조합: /이슈목록 @jun,@sean 태그 [TagName]
+// -------------------------------------------------------------
 app.command('/이슈목록', async ({ command, ack, respond, client }) => {
+    return handleIssueListCommand({ command, ack, respond, client });
+});
+
+// (removed duplicate /태그목록 wrapper)
+
+async function handleIssueListCommand({ command, ack, respond, client, modeOverride }: any) {
     await ack();
 
     try {
-        const slackUser = await client.users.info({ user: command.user_id });
-        const userEmail = slackUser.user?.profile?.email;
+        const raw = (command.text || '').trim();
+        const tokens = raw ? raw.split(/\s+/) : [];
 
-        if (!userEmail) {
-            await respond({ text: "❌ Slack 프로필에서 이메일을 찾을 수 없습니다.", response_type: 'ephemeral' });
-            return;
-        }
+        let mode: 'state' | 'tag' = modeOverride || 'state';
+        let requestedTag: string | undefined;
 
-        const linearUser = await getLinearUserByEmail(userEmail);
-        if (!linearUser) {
-            await respond({ text: "❌ Linear에서 사용자를 찾을 수 없습니다.", response_type: 'ephemeral' });
-            return;
-        }
+        const assigneeTokens: string[] = [];
 
-        const issues = await linearClient.issues({
-            filter: {
-                assignee: { id: { eq: linearUser.id } },
-                state: { type: { nin: ['completed', 'canceled'] } }
+        // token parse
+        for (let i = 0; i < tokens.length; i++) {
+            const t = tokens[i];
+
+            if (t === '태그' || t.toLowerCase() === 'tag') {
+                mode = 'tag';
+                const next = tokens[i + 1];
+                if (next && !next.startsWith('@') && !next.startsWith('<@')) {
+                    requestedTag = next;
+                }
+                continue;
             }
-        });
 
-        if (issues.nodes.length === 0) {
-            await respond({ text: "✅ 현재 나에게 할당된 진행 중인 이슈가 없습니다.", response_type: 'in_channel' });
+            // assignee token candidates: @jun or <@U123> possibly comma-separated
+            if (t.startsWith('@') || t.startsWith('<@')) {
+                const parts = t.split(',').map((s: string) => s.trim()).filter(Boolean);
+                for (const p of parts) {
+                    if (p.startsWith('@') || p.startsWith('<@')) assigneeTokens.push(p);
+                }
+            }
+        }
+
+        // resolve slack user ids
+        const assigneeSlackIds: string[] = [];
+        if (assigneeTokens.length > 0) {
+            for (const tok of assigneeTokens) {
+                const id = await resolveSlackUserIdFromToken(client, tok);
+                if (id && !assigneeSlackIds.includes(id)) assigneeSlackIds.push(id);
+            }
+
+            // If user explicitly specified assignee(s) but none could be resolved,
+            // do NOT silently fall back to requester.
+            if (assigneeSlackIds.length === 0) {
+                await respond({
+                    text: `❌ 지정한 사용자(${assigneeTokens.join(', ')})를 Slack에서 찾지 못했어요.\n가능하면 슬랙에서 사용자 자동완성으로 멘션을 선택해서 <@U...> 형태로 입력해줘. 예: /이슈목록 <@U12345>\n(또는 봇에 users:read 권한이 없으면 @handle 매칭이 실패할 수 있어요.)`,
+                    response_type: 'ephemeral'
+                });
+                return;
+            }
+        }
+
+        if (assigneeSlackIds.length === 0) {
+            assigneeSlackIds.push(command.user_id);
+        }
+
+        // fetch issues for each assignee
+        const allIssues: any[] = [];
+        const failedAssignees: string[] = [];
+
+        for (const slackId of assigneeSlackIds) {
+            const email = await getSlackEmailByUserId(client, slackId);
+            if (!email) {
+                failedAssignees.push(`<@${slackId}>`);
+                continue;
+            }
+
+            const linearUser = await getLinearUserByEmail(email);
+            if (!linearUser) {
+                failedAssignees.push(`<@${slackId}>`);
+                continue;
+            }
+
+            const issuesRes = await fetchActiveIssuesByAssigneeId(linearUser.id);
+            const issues = issuesRes.nodes || [];
+            allIssues.push(...issues);
+        }
+
+        if (allIssues.length === 0) {
+            const who = assigneeSlackIds.map(id => `<@${id}>`).join(', ');
+            await respond({
+                text: `✅ ${who}에게 할당된 진행 중 이슈가 없습니다.`,
+                response_type: 'in_channel'
+            });
             return;
         }
 
-        const groupedIssues: Record<string, any[]> = {};
-        for (const issue of issues.nodes) {
-            const state = await issue.state;
-            const stateName = state?.name || 'Unknown';
-            if (!groupedIssues[stateName]) groupedIssues[stateName] = [];
-            groupedIssues[stateName].push(issue);
+        if (failedAssignees.length > 0) {
+            // best-effort warning (ephemeral)
+            await respond({
+                text: `⚠️ 일부 사용자는 매칭에 실패했어요: ${failedAssignees.join(', ')}\n가능하면 슬랙에서 멘션 자동완성으로 선택(<@U...>)해서 다시 시도해줘.`,
+                response_type: 'ephemeral'
+            });
         }
 
-        const rootMessage = await client.chat.postMessage({
-            channel: command.channel_id,
-            text: `🔍 <@${command.user_id}>님의 이슈 목록을 조회했습니다.`,
-            blocks: [
-                {
-                    type: "section",
-                    text: {
-                        type: "mrkdwn",
-                        text: `🔍 *<@${command.user_id}>님께 할당된 활성 이슈 목록*`
-                    }
-                },
-                {
-                    type: "context",
-                    elements: [
-                        {
-                            type: "mrkdwn",
-                            text: `총 ${issues.nodes.length}개의 이슈가 있습니다. 자세한 내용은 스레드를 확인해주세요! 👇`
-                        }
-                    ]
-                }
-            ]
-        });
+        const rows = await buildIssueRows(allIssues);
 
-        if (!rootMessage.ts) throw new Error("Failed to post root message.");
-
-        const threadBlocks: any[] = [];
-        for (const [stateName, stateIssues] of Object.entries(groupedIssues)) {
-            threadBlocks.push({
-                type: "section",
-                text: {
-                    type: "mrkdwn",
-                    text: `*📂 ${stateName} (${stateIssues.length})*`
-                }
+        if (mode === 'tag') {
+            const grouped = groupRowsByTags(rows, requestedTag);
+            const keys = Object.keys(grouped);
+            if (keys.length === 0) {
+                await respond({ text: `✅ 태그 "${requestedTag}"에 해당하는 진행 중 이슈가 없습니다.`, response_type: 'in_channel' });
+                return;
+            }
+            await postGroupedListToThread({
+                client,
+                channelId: command.channel_id,
+                requesterId: command.user_id,
+                assigneeSlackIds,
+                mode,
+                requestedTag,
+                grouped,
+                totalIssues: allIssues.length
             });
-
-            const issueLinks = stateIssues.map(i => `• <${i.url}|[${i.identifier}] ${i.title}>`).join('\n');
-            threadBlocks.push({
-                type: "section",
-                text: {
-                    type: "mrkdwn",
-                    text: issueLinks
-                }
-            });
-            threadBlocks.push({ type: "divider" });
+            return;
         }
 
-        await client.chat.postMessage({
-            channel: command.channel_id,
-            thread_ts: rootMessage.ts,
-            text: "상세 이슈 리스트",
-            blocks: threadBlocks
+        const grouped = groupRowsByState(rows);
+        await postGroupedListToThread({
+            client,
+            channelId: command.channel_id,
+            requesterId: command.user_id,
+            assigneeSlackIds,
+            mode,
+            grouped,
+            totalIssues: allIssues.length
         });
 
     } catch (error) {
         console.error(error);
-        await respond({ text: `❌ 오류가 발생했습니다: ${(error as Error).message}`, response_type: 'ephemeral' });
+        let msg = (error as Error).message || String(error);
+
+        // Common Slack error when bot isn't in the channel where the slash command was used
+        if (msg.includes('channel_not_found')) {
+            msg = "봇이 이 채널에 초대되지 않았습니다. 채널에서 `/invite @봇이름`(Lenaer)로 초대한 뒤 다시 시도해주세요.";
+        }
+
+        await respond({ text: `❌ 오류가 발생했습니다: ${msg}`, response_type: 'ephemeral' });
     }
+}
+
+// /태그목록은 위 helper를 사용
+app.command('/태그목록', async ({ command, ack, respond, client }) => {
+    // Ensure modeOverride=tag, and allow optional @user + tag filter
+    return handleIssueListCommand({ command, ack, respond, client, modeOverride: 'tag' });
 });
 
 // Action Handler: 나에게 할당 버튼 (Assign to me - Button)
@@ -771,6 +1103,8 @@ app.action('mark_done', async ({ action, ack, body, client }) => {
         console.error(error);
     }
 });
+
+
 
 (async () => {
     const port = process.env.PORT || 3000;
